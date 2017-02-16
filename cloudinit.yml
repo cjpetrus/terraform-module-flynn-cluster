@@ -1,0 +1,52 @@
+#cloud-config
+
+package_update: true
+packages:
+- jq
+- awscli
+- git
+- postgresql-client-9.5
+runcmd:
+- echo "127.0.0.1\tlocalhost $(curl -Lfs http://169.254.169.254/latest/meta-data/local-hostname) $(hostname)" >> /etc/hosts
+- echo "$(curl -Lfs http://169.254.169.254/latest/meta-data/public-ipv4)\t${flynn_domain} controller.${flynn_domain}" >> /etc/hosts
+- export AWS_DEFAULT_REGION=$(curl -Lfs http://169.254.169.254/latest/dynamic/instance-identity/document|grep region|awk -F\" '{print $4}')
+- curl -fsSL "https://dl.flynn.io/install-flynn" | bash
+- flynn-host init --discovery https://discovery.flynn.io/clusters/${discovery_token}
+- systemctl enable flynn-host
+- systemctl start flynn-host
+- >
+  while [ $(aws ec2 describe-instances --instance-ids "`aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${flynn_domain} | jq -r '[.AutoScalingGroups[].Instances[].InstanceId]'`" --filters Name=instance-state-name,Values=running | jq '.Reservations[].Instances[].InstanceId' | wc -l) -lt ${flynn_nodes} ]; do
+    sleep 60
+  done
+- >
+  ROUTE53_RECORD=$(aws ec2 describe-instances --instance-ids "`aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${flynn_domain} | jq -r '[.AutoScalingGroups[].Instances[].InstanceId]'`" --filters Name=instance-state-name,Values=running | jq '[.Reservations[].Instances[] | {Value: .PublicIpAddress}]') &&
+  echo '{
+    "Comment": "auto updated @ '$(date)'",
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "${flynn_domain}",
+        "Type": "A",
+        "TTL": 60,
+        "ResourceRecords": '$ROUTE53_RECORD'
+      }
+    }]
+  }' > /tmp/route53_update.json &&
+  aws route53 change-resource-record-sets --hosted-zone-id ${dns_zone_id} --change-batch file:///tmp/route53_update.json
+- >
+  while [ $(curl -Lfs https://discovery.flynn.io/clusters/${discovery_token}/instances | jq -rc '.data[].id' | wc -l) -lt ${flynn_nodes} ]; do
+    sleep 60
+  done
+- INSTANCE_IP=$(curl -Lfs http://169.254.169.254/latest/meta-data/local-ipv4)
+- >
+  if [ "$INSTANCE_IP" = "$(curl -Lfs https://discovery.flynn.io/clusters/${discovery_token}/instances | jq -rc '.data | sort_by(.created_at) [0].url' | sed -E 's/(https?:\/\/|:[0-9]+)//g')" ]; then
+    CLUSTER_DOMAIN="${flynn_domain}" flynn-host bootstrap -t 3600 --min-hosts ${flynn_nodes} --discovery https://discovery.flynn.io/clusters/${discovery_token}
+  fi
+- >
+  while [ $(flynn-host list | grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | wc -l) -lt ${flynn_nodes} ]; do
+    sleep 60
+  done
+- >
+  if [ "$(flynn-host list | grep $INSTANCE_IP | awk '{print $3}')" = "proxy" ]; then
+    flynn-host promote $INSTANCE_IP
+  fi
